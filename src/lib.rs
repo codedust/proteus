@@ -9,6 +9,7 @@ extern crate bincode;
 extern crate hkdf;
 extern crate libc;
 extern crate sodiumoxide;
+extern crate "persistent-list" as list;
 extern crate "rustc-serialize" as rustc_serialize;
 
 mod internal;

@@ -19,3 +19,6 @@ git = "https://github.com/twittner/hkdf"
 
 [dependencies.bincode]
 git = "https://github.com/TyOverby/bincode"
+
+[dependencies.persistent-list]
+git = "https://github.com/twittner/persistent-list"

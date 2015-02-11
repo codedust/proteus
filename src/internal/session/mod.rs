@@ -10,11 +10,10 @@ use internal::keys::{IdentityKey, IdentityKeyPair, PreKeyBundle, PreKey, PreKeyI
 use internal::keys::{KeyPair, PublicKey};
 use internal::message::{Counter, PreKeyMessage, Envelope, Message, CipherMessage};
 use internal::util;
-use std::cmp::{Ord, Ordering};
-use std::collections::RingBuf;
+use list::List;
 use std::error::{Error, FromError};
 use std::fmt;
-use std::iter::count;
+use std::cmp::{Ord, Ordering};
 use std::vec::Vec;
 
 pub mod binary;
@@ -140,7 +139,7 @@ pub struct Session {
     local_identity:  IdentityKeyPair,
     remote_identity: IdentityKey,
     pending_prekey:  Option<(PreKeyId, PublicKey)>,
-    session_states:  RingBuf<SessionState>
+    session_states:  List<SessionState>
 }
 
 struct AliceParams<'r> {
@@ -159,8 +158,7 @@ struct BobParams<'r> {
 impl Session {
     pub fn init_from_prekey<'r>(alice: &'r IdentityKeyPair, pk: PreKeyBundle) -> Session {
         let alice_base = KeyPair::new();
-        let mut states = RingBuf::new();
-        states.push_front(SessionState::init_as_alice(AliceParams {
+        let states     = List::singleton(SessionState::init_as_alice(AliceParams {
             alice_ident:   alice,
             alice_base:    &alice_base,
             bob:           &pk
@@ -186,7 +184,7 @@ impl Session {
             local_identity:  ours.clone(),
             remote_identity: msg.identity_key,
             pending_prekey:  None,
-            session_states:  RingBuf::new()
+            session_states:  List::nil()
         };
 
         let plain = try!(session.decrypt(store, env));
@@ -198,11 +196,14 @@ impl Session {
     pub fn encrypt(&mut self, plain: &[u8]) -> Envelope {
         assert!(!self.session_states.is_empty());
 
-        let pending  = self.pending_prekey;
-        let identity = self.local_identity.public_key;
-        let state    = self.session_states.front_mut().unwrap();
+        let pending   = self.pending_prekey;
+        let identity  = self.local_identity.public_key;
+        let mut state = self.session_states.hd().unwrap().clone();
+        let envelope  = state.encrypt(identity, &pending, plain);
 
-        state.encrypt(identity, &pending, plain)
+        self.session_states = self.session_states.tl().cons(state);
+
+        envelope
     }
 
     pub fn decrypt<E: Error>(&mut self, store: &mut PreKeyStore<E>, env: &Envelope) -> Result<Vec<u8>, DecryptError<E>> {
@@ -219,31 +220,35 @@ impl Session {
         assert!(!self.session_states.is_empty());
 
         // try first session state
-        let mut first_state = self.session_states[0].clone();
+        let mut first_state = self.session_states.hd().unwrap().clone();
+        let other_states    = self.session_states.tl();
         let first_result    = first_state.decrypt(env, mesg);
 
         if first_result.is_ok() {
-            self.session_states[0] = first_state;
-            self.pending_prekey    = None;
+            self.session_states = other_states.cons(first_state);
+            self.pending_prekey = None;
             return first_result
         }
 
         // try remaining session states
-        let result =
-            self.session_states.iter().skip(1).zip(count(1, 1)).map(|(s0, i)| {
-                let mut s1 = s0.clone();
-                let result = s1.decrypt(env, mesg);
-                if result.is_ok() {
-                    Some((result, s1, i))
-                } else {
-                    None
+        let (result, states) =
+            other_states.foldr((None, List::Nil), |s, (res, states)| {
+                if res.is_some() {
+                    return (res, states.cons(s.clone()))
                 }
-            }).find(|x| x.is_some()).and_then(|x| x);
+                let mut st = s.clone();
+                let result = st.decrypt(env, mesg);
+                if result.is_ok() {
+                    (Some((result, st)), states)
+                } else {
+                    (None, states.cons(s.clone()))
+                }
+            });
 
         match result {
-            Some((plain, new_state, ix)) => {
-                self.session_states.remove(ix);
-                self.session_states.push_front(new_state);
+            Some((plain, new_state)) => {
+                let first_state     = self.session_states.hd().unwrap().clone();
+                self.session_states = states.cons(first_state).cons(new_state);
                 self.pending_prekey = None;
                 plain
             }
@@ -259,11 +264,14 @@ impl Session {
                 alice_ident: &m.identity_key,
                 alice_base:  &m.base_key
             });
-            self.session_states.push_front(new_state);
-            if self.session_states.len() > MAX_SESSION_STATES {
-                self.session_states.pop_back();
-            }
+            self.session_states =
+                if self.session_states.len() == MAX_SESSION_STATES {
+                    self.session_states.init().cons(new_state)
+                } else {
+                    self.session_states.cons(new_state)
+                }
         });
+
         if m.prekey_id != keys::MAX_PREKEY_ID {
             try!(store.remove(m.prekey_id));
         }
@@ -291,11 +299,11 @@ impl Session {
 
 #[derive(Clone)]
 pub struct SessionState {
-    recv_chains:     RingBuf<RecvChain>,
+    recv_chains:     List<RecvChain>,
     send_chain:      SendChain,
     root_key:        RootKey,
     prev_counter:    Counter,
-    skipped_msgkeys: RingBuf<MessageKeys>
+    skipped_msgkeys: List<MessageKeys>
 }
 
 impl SessionState {
@@ -313,9 +321,7 @@ impl SessionState {
         // receiving chain
         let rootkey  = RootKey::from_cipher_key(dsecs.cipher_key);
         let chainkey = ChainKey::from_mac_key(dsecs.mac_key, Counter::zero());
-
-        let mut recv_chains = RingBuf::with_capacity(MAX_RECV_CHAINS + 1);
-        recv_chains.push_front(RecvChain::new(chainkey, p.bob.public_key));
+        let recv_chains = List::singleton(RecvChain::new(chainkey, p.bob.public_key));
 
         // sending chain
         let send_ratchet = KeyPair::new();
@@ -327,7 +333,7 @@ impl SessionState {
             send_chain:      send_chain,
             root_key:        rok,
             prev_counter:    Counter::zero(),
-            skipped_msgkeys: RingBuf::new()
+            skipped_msgkeys: List::nil()
         }
     }
 
@@ -348,11 +354,11 @@ impl SessionState {
         let send_chain = SendChain::new(chainkey, p.bob_prekey);
 
         SessionState {
-            recv_chains:     RingBuf::with_capacity(MAX_RECV_CHAINS + 1),
+            recv_chains:     List::nil(),
             send_chain:      send_chain,
             root_key:        rootkey,
             prev_counter:    Counter::zero(),
-            skipped_msgkeys: RingBuf::new()
+            skipped_msgkeys: List::nil()
         }
     }
 
@@ -378,12 +384,12 @@ impl SessionState {
         self.root_key     = send_root_key;
         self.prev_counter = self.send_chain.chain_key.idx;
         self.send_chain   = send_chain;
-
-        self.recv_chains.push_front(recv_chain);
-
-        if self.recv_chains.len() > MAX_RECV_CHAINS {
-            self.recv_chains.pop_back();
-        }
+        self.recv_chains  =
+            if self.recv_chains.len() == MAX_RECV_CHAINS {
+                self.recv_chains.init().cons(recv_chain)
+            } else {
+                self.recv_chains.cons(recv_chain)
+            }
     }
 
     fn encrypt(&mut self, ident: IdentityKey, pending: &Option<(PreKeyId, PublicKey)>, plain: &[u8]) -> Envelope {
@@ -410,41 +416,60 @@ impl SessionState {
         Envelope::new(&msgkeys.mac_key, message)
     }
 
-    fn decrypt<E>(&mut self, env: &Envelope, m: &CipherMessage) -> Result<Vec<u8>, DecryptError<E>> {
-        let i = match self.recv_chains.iter().position(|c| c.ratchet_key == m.ratchet_key) {
-            Some(i) => i,
-            None    => {
+    fn find_recv_chain(&mut self, m: &CipherMessage) -> RecvChain {
+        match self.recv_chains.clone().iter().find(|c| c.ratchet_key == m.ratchet_key) {
+            Some(rc) => rc.clone(),
+            None     => {
                 self.ratchet(m.ratchet_key);
-                0
+                self.recv_chains.hd().unwrap().clone()
             }
-        };
+        }
+    }
 
-        match m.counter.cmp(&self.recv_chains[i].chain_key.idx) {
+    fn decrypt<E>(&mut self, env: &Envelope, m: &CipherMessage) -> Result<Vec<u8>, DecryptError<E>> {
+        let rc = self.find_recv_chain(m);
+        match m.counter.cmp(&rc.chain_key.idx) {
             Ordering::Less    => self.try_skipped_message_keys(env, m),
             Ordering::Greater => {
-                let (chk, mk, mks) = try!(SessionState::stage_skipped_message_keys(m, &self.recv_chains[i]));
+                let (chk, mk, mks) = try!(SessionState::stage_skipped_message_keys(m, &rc));
                 if !env.verify(&mk.mac_key) {
                     return Err(DecryptError::InvalidSignature)
                 }
                 let plain = mk.decrypt(m.cipher_text.as_slice());
-                self.recv_chains[i].chain_key = chk.next();
-                self.commit_skipped_message_keys(mks);
+                self.recv_chains =
+                    self.recv_chains.map(|c|
+                        if c.ratchet_key == rc.ratchet_key {
+                            let mut r   = rc.clone();
+                            r.chain_key = chk.next();
+                            r
+                        } else {
+                            c.clone()
+                        });
+                self.commit_skipped_message_keys(&mks);
                 Ok(plain)
             }
             Ordering::Equal => {
-                let mks = self.recv_chains[i].chain_key.message_keys();
+                let mks = rc.chain_key.message_keys();
                 if !env.verify(&mks.mac_key) {
                     return Err(DecryptError::InvalidSignature)
                 }
                 let plain = mks.decrypt(m.cipher_text.as_slice());
-                self.recv_chains[i].chain_key = self.recv_chains[i].chain_key.next();
+                self.recv_chains =
+                    self.recv_chains.map(|c|
+                        if c.ratchet_key == rc.ratchet_key {
+                            let mut r   = rc.clone();
+                            r.chain_key = rc.chain_key.next();
+                            r
+                        } else {
+                            c.clone()
+                        });
                 Ok(plain)
             }
         }
     }
 
     fn try_skipped_message_keys<E>(&mut self, env: &Envelope, mesg: &CipherMessage) -> Result<Vec<u8>, DecryptError<E>> {
-        let too_old = self.skipped_msgkeys.get(0)
+        let too_old = self.skipped_msgkeys.hd()
             .map(|k| k.counter > mesg.counter)
             .unwrap_or(false);
 
@@ -452,31 +477,31 @@ impl SessionState {
             return Err(DecryptError::OutdatedMessage)
         }
 
-        match self.skipped_msgkeys.iter().position(|mk| mk.counter == mesg.counter) {
-            Some(i) => {
-                let mk = self.skipped_msgkeys.remove(i).unwrap();
+        match self.skipped_msgkeys.partition(|mk| mk.counter == mesg.counter) {
+            (List::Cons(mk, _), ys) => {
+                self.skipped_msgkeys = ys;
                 if env.verify(&mk.mac_key) {
                     Ok(mk.decrypt(mesg.cipher_text.as_slice()))
                 } else {
                     Err(DecryptError::InvalidMessage)
                 }
             }
-            None => Err(DecryptError::DuplicateMessage)
+            (List::Nil, _) => Err(DecryptError::DuplicateMessage)
         }
     }
 
-    fn stage_skipped_message_keys<E>(msg: &CipherMessage, chr: &RecvChain) -> Result<(ChainKey, MessageKeys, RingBuf<MessageKeys>), DecryptError<E>> {
+    fn stage_skipped_message_keys<E>(msg: &CipherMessage, chr: &RecvChain) -> Result<(ChainKey, MessageKeys, List<MessageKeys>), DecryptError<E>> {
         let num = (msg.counter.value() - chr.chain_key.idx.value()) as usize;
 
         if num > MAX_COUNTER_GAP {
             return Err(DecryptError::TooDistantFuture)
         }
 
-        let mut buf = RingBuf::with_capacity(num);
+        let mut buf = List::nil();
         let mut chk = chr.chain_key.clone();
 
         for _ in 0 .. num {
-            buf.push_back(chk.message_keys());
+            buf = buf.cons(chk.message_keys());
             chk = chk.next()
         }
 
@@ -484,20 +509,19 @@ impl SessionState {
         Ok((chk, mk, buf))
     }
 
-    fn commit_skipped_message_keys(&mut self, mks: RingBuf<MessageKeys>) {
+    fn commit_skipped_message_keys(&mut self, mks: &List<MessageKeys>) {
         assert!(mks.len() <= MAX_COUNTER_GAP);
 
         let excess = self.skipped_msgkeys.len() as isize
                    + mks.len() as isize
                    - MAX_COUNTER_GAP as isize;
 
-        for _ in 0 .. excess {
-            self.skipped_msgkeys.pop_front();
-        }
-
-        for m in mks.into_iter() {
-            self.skipped_msgkeys.push_back(m)
-        }
+        self.skipped_msgkeys =
+            if excess > 0 {
+                self.skipped_msgkeys.drop(excess as usize).append(mks)
+            } else {
+                self.skipped_msgkeys.append(mks)
+            };
 
         assert!(self.skipped_msgkeys.len() <= MAX_COUNTER_GAP);
     }
@@ -615,24 +639,25 @@ mod tests {
 
         let mut alice = Session::init_from_prekey(&alice_ident, bob_bundle);
         alice = Session::decode(&alice.encode()).unwrap();
-        assert_eq!(1, alice.session_states[0].recv_chains.len());
+        assert_eq!(1, alice.session_states.hd().unwrap().recv_chains.len());
 
         let hello_bob = alice.encrypt(b"Hello Bob!");
         let hello_bob_delayed = alice.encrypt(b"Hello delay!");
+
         assert_eq!(1, alice.session_states.len());
-        assert_eq!(1, alice.session_states[0].recv_chains.len());
+        assert_eq!(1, alice.session_states.hd().unwrap().recv_chains.len());
 
         let mut bob = assert_init_from_message(&bob_ident, &mut bob_store, &hello_bob, b"Hello Bob!");
         bob = Session::decode(&bob.encode()).unwrap();
         assert_eq!(1, bob.session_states.len());
-        assert_eq!(1, bob.session_states[0].recv_chains.len());
+        assert_eq!(1, bob.session_states.hd().unwrap().recv_chains.len());
         assert_eq!(bob.remote_identity.fingerprint(), alice.local_identity.public_key.fingerprint());
 
         let hello_alice = bob.encrypt(b"Hello Alice!");
 
         // Alice
         assert_decrypt(b"Hello Alice!", alice.decrypt(&mut alice_store, &hello_alice));
-        assert_eq!(2, alice.session_states[0].recv_chains.len());
+        assert_eq!(2, alice.session_states.hd().unwrap().recv_chains.len());
         assert_eq!(alice.remote_identity.fingerprint(), bob.local_identity.public_key.fingerprint());
         let ping_bob_1 = alice.encrypt(b"Ping1!");
         let ping_bob_2 = alice.encrypt(b"Ping2!");
@@ -640,20 +665,20 @@ mod tests {
 
         // Bob
         assert_decrypt(b"Ping1!", bob.decrypt(&mut bob_store, &ping_bob_1));
-        assert_eq!(2, bob.session_states[0].recv_chains.len());
+        assert_eq!(2, bob.session_states.hd().unwrap().recv_chains.len());
         assert_decrypt(b"Ping2!", bob.decrypt(&mut bob_store, &ping_bob_2));
-        assert_eq!(2, bob.session_states[0].recv_chains.len());
+        assert_eq!(2, bob.session_states.hd().unwrap().recv_chains.len());
         let pong_alice = bob.encrypt(b"Pong!");
         assert_prev_count(&bob, 1);
 
         // Alice
         assert_decrypt(b"Pong!", alice.decrypt(&mut alice_store, &pong_alice));
-        assert_eq!(3, alice.session_states[0].recv_chains.len());
+        assert_eq!(3, alice.session_states.hd().unwrap().recv_chains.len());
         assert_prev_count(&alice, 2);
 
         // Bob (Delayed (prekey) message, decrypted with the "old" receive chain)
         assert_decrypt(b"Hello delay!", bob.decrypt(&mut bob_store, &hello_bob_delayed));
-        assert_eq!(2, bob.session_states[0].recv_chains.len());
+        assert_eq!(2, bob.session_states.hd().unwrap().recv_chains.len());
         assert_prev_count(&bob, 1);
     }
 
@@ -680,19 +705,19 @@ mod tests {
         let hello5 = bob.encrypt(b"Hello5");
 
         assert_decrypt(b"Hello2", alice.decrypt(&mut alice_store, &hello2));
-        assert_eq!(1, alice.session_states[0].skipped_msgkeys.len());
+        assert_eq!(1, alice.session_states.hd().unwrap().skipped_msgkeys.len());
 
         assert_decrypt(b"Hello1", alice.decrypt(&mut alice_store, &hello1));
-        assert_eq!(0, alice.session_states[0].skipped_msgkeys.len());
+        assert_eq!(0, alice.session_states.hd().unwrap().skipped_msgkeys.len());
 
         assert_decrypt(b"Hello3", alice.decrypt(&mut alice_store, &hello3));
-        assert_eq!(0, alice.session_states[0].skipped_msgkeys.len());
+        assert_eq!(0, alice.session_states.hd().unwrap().skipped_msgkeys.len());
 
         assert_decrypt(b"Hello5", alice.decrypt(&mut alice_store, &hello5));
-        assert_eq!(1, alice.session_states[0].skipped_msgkeys.len());
+        assert_eq!(1, alice.session_states.hd().unwrap().skipped_msgkeys.len());
 
         assert_decrypt(b"Hello4", alice.decrypt(&mut alice_store, &hello4));
-        assert_eq!(0, alice.session_states[0].skipped_msgkeys.len());
+        assert_eq!(0, alice.session_states.hd().unwrap().skipped_msgkeys.len());
 
         for m in vec![hello1, hello2, hello3, hello4, hello5].iter() {
             assert_eq!(Some(DecryptError::DuplicateMessage), alice.decrypt(&mut alice_store, m).err());
@@ -872,6 +897,6 @@ mod tests {
     }
 
     fn assert_prev_count(s: &Session, expected: u32) {
-        assert_eq!(expected, s.session_states[0].prev_counter.value());
+        assert_eq!(expected, s.session_states.hd().unwrap().prev_counter.value());
     }
 }
