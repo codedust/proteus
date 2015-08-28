@@ -16,6 +16,7 @@ mod internal;
 pub mod keys;
 pub mod session;
 pub mod message;
+pub mod binary;
 
 pub fn init() {
     sodiumoxide::init();
